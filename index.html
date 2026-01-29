@@ -713,8 +713,13 @@
   <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
 
   <script>
-    // TLC identifier (özgün)
-    const IA_IDENTIFIER_1 = "Tlcfsp";
+    // =========================
+    // TLC (STATIK) SOURCE
+    // =========================
+    const IA_IDENTIFIER_1 = "Tlcfsp";      // TLC IA identifier
+    const SRC_PREFIX = "S1";              // tek kaynak
+    const LIST_NEVER_CHANGES = true;      // statik liste
+    const FORCE_REFRESH = new URLSearchParams(location.search).has("refresh"); // ?refresh=1
 
     const DL_PROXY = "https://fspdownload.protokolfsp.workers.dev/";
     const COUNTER_API = "https://fspdlcounter.protokolfsp.workers.dev";
@@ -778,7 +783,7 @@
         audio_id: it.id,
         audio_title: it.title,
         file_name: (it.name || "").split("/").pop() || "",
-        src: it.src || "S1"
+        src: it.src || SRC_PREFIX
       });
     }
     function trackAudioDownload(it, filename) {
@@ -786,12 +791,18 @@
         audio_id: it.id,
         audio_title: it.title,
         file_name: filename || (it.name || "").split("/").pop() || "",
-        src: it.src || "S1"
+        src: it.src || SRC_PREFIX
       });
     }
 
+    // =========================
+    // COUNTERS (play/download) - offline-safe
+    // =========================
     let globalPlayCounts = {};
     let globalDownloadCounts = {};
+
+    let counterStatus = "";
+    let lastCountsOkAt = 0;
 
     function chunk(arr, size){
       const out = [];
@@ -806,16 +817,17 @@
           method: "POST",
           mode: "cors",
           cache: "no-store",
-          headers: {
-            "content-type": IS_SAFARI ? "text/plain;charset=utf-8" : "application/json"
-          },
+          headers: { "content-type": IS_SAFARI ? "text/plain;charset=utf-8" : "application/json" },
           body: JSON.stringify({ type, ids })
         });
-        if (!res.ok) throw new Error("counts failed");
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const j = await res.json();
-        return (j && j.counts) ? j.counts : {};
+        if (!j || j.ok !== true || !j.counts) throw new Error("bad json");
+        lastCountsOkAt = Date.now();
+        counterStatus = "";
+        return j.counts || {};
       }catch{
-        return {};
+        return null; // kritik: mevcut sayacı silme
       }
     }
 
@@ -831,25 +843,34 @@
       const ids = items.map(it => it.id);
       const parts = chunk(ids, 200);
 
-      const playAll = {};
-      const dlAll = {};
+      const playAll = { ...globalPlayCounts };
+      const dlAll   = { ...globalDownloadCounts };
+
+      let anyOk = false;
 
       for (const part of parts){
         const [p, d] = await Promise.all([
           fetchCounts("play", part),
           fetchCounts("download", part),
         ]);
-        Object.assign(playAll, p);
-        Object.assign(dlAll, d);
+
+        if (p && typeof p === "object"){
+          anyOk = true;
+          for (const id of part) playAll[id] = Number(p[id]) || 0;
+        }
+        if (d && typeof d === "object"){
+          anyOk = true;
+          for (const id of part) dlAll[id] = Number(d[id]) || 0;
+        }
       }
 
-      const playHas = Object.keys(playAll).length > 0;
-      const dlHas   = Object.keys(dlAll).length > 0;
-
-      if (!playHas && !dlHas) return;
-
-      if (playHas) globalPlayCounts = playAll;
-      if (dlHas)   globalDownloadCounts = dlAll;
+      if (anyOk){
+        globalPlayCounts = playAll;
+        globalDownloadCounts = dlAll;
+        counterStatus = "";
+      } else {
+        counterStatus = "Sayaç bağlantısı geçici olarak yok (değerler korunuyor).";
+      }
 
       render();
     }
@@ -867,10 +888,7 @@
         const data = JSON.stringify(payload);
 
         if (IS_SAFARI && navigator.sendBeacon){
-          const ok = navigator.sendBeacon(
-            url,
-            new Blob([data], { type: "text/plain;charset=utf-8" })
-          );
+          const ok = navigator.sendBeacon(url, new Blob([data], { type: "text/plain;charset=utf-8" }));
           if (ok) return;
         }
 
@@ -879,9 +897,7 @@
           mode: "cors",
           cache: "no-store",
           keepalive: true,
-          headers: {
-            "content-type": IS_SAFARI ? "text/plain;charset=utf-8" : "application/json"
-          },
+          headers: { "content-type": IS_SAFARI ? "text/plain;charset=utf-8" : "application/json" },
           body: data
         }).catch(() => {});
       }catch{}
@@ -896,6 +912,7 @@
       }
     }
 
+    // Play sayımı: gerçekten "playing" olunca 1 kez
     let playGate = { id: null, armed: false, sent: false };
     function armPlayGate(it){
       playGate = { id: it?.id || null, armed: true, sent: false };
@@ -918,6 +935,9 @@
       statusEl.textContent = "Audio hata: " + (code || "bilinmiyor");
     });
 
+    // =========================
+    // LOCAL STORAGE
+    // =========================
     const LS = {
       favs:  "fsp1.favs.v1",
       pos:   "fsp1.fp.pos.v1",
@@ -928,11 +948,21 @@
       sortDirPlay: "fsp1.sort.play.dir.v1",
       sortDirDl:   "fsp1.sort.dl.dir.v1",
       speed: "fsp1.speed.v1",
-      zoom:  "fsp1.ui.zoom.v1"
+      zoom:  "fsp1.ui.zoom.v1",
+
+      // LIST CACHE (STATIK)
+      itemsS1:   "fsp1.items.TLC.v1",
+      itemsS1At: "fsp1.items.TLC.at.v1",
     };
 
     const loadMap = (k) => { try { return JSON.parse(localStorage.getItem(k) || "{}"); } catch { return {}; } };
     const saveMap = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+    function loadAny(k){ try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } }
+    function saveAny(k, v){ localStorage.setItem(k, JSON.stringify(v)); }
+    function loadAt(k){
+      const n = Number(localStorage.getItem(k) || "0");
+      return Number.isFinite(n) ? n : 0;
+    }
 
     let favs  = loadMap(LS.favs);
     let durs  = loadMap(LS.durs);
@@ -953,6 +983,9 @@
     if (!localStorage.getItem(LS.sortDirPlay)) localStorage.setItem(LS.sortDirPlay, playSortDir);
     if (!localStorage.getItem(LS.sortDirDl)) localStorage.setItem(LS.sortDirDl, dlSortDir);
 
+    // =========================
+    // SPEED
+    // =========================
     const SPEEDS = [0.5, 0.75, 0.9, 1, 1.25, 1.5, 1.75, 2.0, 2.25];
     let speedIndex = SPEEDS.indexOf(1);
 
@@ -991,6 +1024,9 @@
     slowBtn.addEventListener("click", (e) => { e.stopPropagation(); applySpeedByIndex(speedIndex - 1); });
     fastBtn.addEventListener("click", (e) => { e.stopPropagation(); applySpeedByIndex(speedIndex + 1); });
 
+    // =========================
+    // ZOOM
+    // =========================
     const ZOOMS = [0.85, 0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2];
     let zoomIndex = ZOOMS.indexOf(1);
     let uiScale = 1;
@@ -1064,10 +1100,14 @@
     attachDoubleTapReset(zoomOutBtn);
     attachDoubleTapReset(zoomInBtn);
 
+    // Search focus -> player sakla
     function setTypingMode(on){ fp.classList.toggle("hiddenWhileTyping", !!on); }
     searchEl.addEventListener("focus", () => setTypingMode(true));
     searchEl.addEventListener("blur",  () => setTypingMode(false));
 
+    // =========================
+    // HELPERS
+    // =========================
     function escHtml(s){
       return (s ?? "").toString()
         .replace(/&/g,"&amp;")
@@ -1156,7 +1196,6 @@
       while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
 
       const ns = "http://www.w3.org/2000/svg";
-
       const mkPath = (d) => {
         const p = document.createElementNS(ns, "path");
         p.setAttribute("d", d);
@@ -1233,6 +1272,9 @@
       render();
     });
 
+    // =========================
+    // DURATION LOADER
+    // =========================
     const durQueue = [];
     const durLoading = new Set();
     let durActive = 0;
@@ -1310,6 +1352,9 @@
       });
     }
 
+    // =========================
+    // DOWNLOAD
+    // =========================
     function makeProxyUrl(fileUrl, filename){
       const u = DL_PROXY + "?u=" + encodeURIComponent(fileUrl);
       return filename ? (u + "&f=" + encodeURIComponent(filename)) : u;
@@ -1350,8 +1395,25 @@
       return `https://archive.org/download/${identifier}/${parts.join("/")}`;
     }
 
+    // =========================
+    // LOAD ITEMS (STATIK + CACHE)
+    // =========================
     async function loadItems(){
-      statusEl.textContent = "Yükleniyor...";
+      const cached = loadAny(LS.itemsS1);
+      const hasCache = Array.isArray(cached) && cached.length > 0;
+
+      // statik ve cache varsa: direkt aç
+      if (LIST_NEVER_CHANGES && hasCache && !FORCE_REFRESH){
+        items = cached;
+        statusEl.textContent = "";
+        setSortIcons();
+        render();
+        scheduleRefreshCounts(120);
+        return;
+      }
+
+      // cache yoksa (ilk açılış) veya refresh istendi
+      statusEl.textContent = hasCache ? "" : "Yükleniyor...";
 
       try{
         const metaUrl = `https://archive.org/metadata/${encodeURIComponent(IA_IDENTIFIER_1)}?v=${Date.now()}`;
@@ -1372,21 +1434,42 @@
             const title = (f.title || "").trim() || decodeURIComponentSafe(name.split("/").pop() || name);
             const url = buildDownloadUrl(IA_IDENTIFIER_1, name);
             const localId = name || url || (title + "#" + idx);
-            const id = "S1|" + localId;
-            return { id, title, name, url, src: "S1" };
+            const id = SRC_PREFIX + "|" + localId;
+            return { id, title, name, url, src: SRC_PREFIX };
           });
 
         items = list;
+
+        // cache yaz (statik olduğu için pratikte bir kere yazılacak)
+        try{
+          saveAny(LS.itemsS1, list);
+          localStorage.setItem(LS.itemsS1At, String(Date.now()));
+        }catch{}
+
         statusEl.textContent = items.length ? "" : "Kayıt bulunamadı.";
         setSortIcons();
         render();
         scheduleRefreshCounts(100);
       }catch(err){
         console.error(err);
+
+        // fallback: cache varsa onunla aç
+        if (hasCache){
+          items = cached;
+          statusEl.textContent = "";
+          setSortIcons();
+          render();
+          scheduleRefreshCounts(120);
+          return;
+        }
+
         statusEl.textContent = "Liste yüklenemedi.";
       }
     }
 
+    // =========================
+    // LIST / RENDER
+    // =========================
     function getVisibleItems(){
       const q = foldTR((searchEl.value || "").trim());
 
@@ -1519,6 +1602,14 @@
         row.addEventListener("click", () => playById(it.id));
         listEl.appendChild(row);
       }
+
+      // sayaç durumu mesajı (varsa göster, yoksa temizle)
+      const cur = (statusEl.textContent || "").trim();
+      if (counterStatus){
+        if (!cur || cur.startsWith("Sayaç")) statusEl.textContent = counterStatus;
+      } else {
+        if (cur.startsWith("Sayaç")) statusEl.textContent = "";
+      }
     }
 
     function iconButton(kind, on, title){
@@ -1650,6 +1741,9 @@
       render();
     });
 
+    // =========================
+    // SEARCH + GA
+    // =========================
     const SEARCH_DEBOUNCE_MS = 900;
     let searchTimer = null;
     let lastSentTermNorm = "";
@@ -1695,6 +1789,9 @@
       renderAndTrackSearch();
     });
 
+    // =========================
+    // DRAGGABLE PLAYER (zoom uyumlu)
+    // =========================
     function restorePlayerPos(){
       try{
         const s = JSON.parse(localStorage.getItem(LS.pos) || "null");
@@ -1888,7 +1985,7 @@
       });
     })();
 
-    // Sorting defaults (Güncel ile aynı)
+    // INIT
     setSortIcons();
     restorePlayerPos();
     restoreSpeed();
